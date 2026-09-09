@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/llm-d/llm-d-router/pkg/epp/metadata"
 )
 
 // seedTurns advances a program to the given turn depth, leaving nothing in flight
@@ -55,20 +57,35 @@ func TestTurnPriority_PrefersLongerWaitWhenTimeWeighted(t *testing.T) {
 	assert.Equal(t, "waiting", got.FlowKey().ID)
 }
 
-// A long enough wait must overcome depth at the default weighting, otherwise a
-// shallow session starves behind deep ones.
-func TestTurnPriority_WaitOvercomesDepthAtDefaultWeight(t *testing.T) {
+// Wait overcomes depth only inside timeWeight*requestTTL, since the flow
+// controller sheds the head once the TTL elapses. At the default weight that
+// bound is 0.5*60 = 30 turn-equivalents.
+func TestTurnPriority_WaitOvercomesDepthWithinRequestTTL(t *testing.T) {
 	cfg := DefaultConfig()
 	s := &turnPriorityStrategy{timeWeight: cfg.TurnPriorityTimeWeight}
 	now := time.Now()
 
-	// At timeWeight 0.05 a turn-50 lead needs ~1000s of wait to overcome.
-	idA, qA := turnInfo("deep", seedTurns(50, now), now)
-	idB, qB := turnInfo("starving", seedTurns(1, now), now.Add(-30*time.Minute))
+	idA, qA := turnInfo("deep", seedTurns(20, now), now)
+	idB, qB := turnInfo("starving", seedTurns(1, now), now.Add(-50*time.Second))
 
 	got := s.Pick(0, map[string]QueueInfo{idA: qA, idB: qB})
 	require.NotNil(t, got)
 	assert.Equal(t, "starving", got.FlowKey().ID)
+}
+
+// Past that bound the deeper session keeps the slot, so the weight has to be
+// chosen against the depth of the workload.
+func TestTurnPriority_DeepSessionHoldsSlotBeyondTTLBound(t *testing.T) {
+	cfg := DefaultConfig()
+	s := &turnPriorityStrategy{timeWeight: cfg.TurnPriorityTimeWeight}
+	now := time.Now()
+
+	idA, qA := turnInfo("deep", seedTurns(60, now), now)
+	idB, qB := turnInfo("newcomer", seedTurns(1, now), now.Add(-60*time.Second))
+
+	got := s.Pick(0, map[string]QueueInfo{idA: qA, idB: qB})
+	require.NotNil(t, got)
+	assert.Equal(t, "deep", got.FlowKey().ID)
 }
 
 func TestTurnPriority_SingleWaitingFlowBypassesScoring(t *testing.T) {
@@ -129,12 +146,48 @@ func TestTurnPriority_NilMetricsCountsAsFirstTurn(t *testing.T) {
 
 func TestTurnPriority_InactivityResetsTurnCount(t *testing.T) {
 	s := &turnPriorityStrategy{inactivitySeconds: 60}
+	now := time.Now()
 
-	idle := seedTurns(30, time.Now().Add(-10*time.Minute))
-	assert.Equal(t, int64(1), s.turnNumberFor(idle))
+	idle := seedTurns(30, now.Add(-10*time.Minute))
+	assert.Equal(t, int64(1), s.turnNumberFor("idle", idle, now))
 
-	active := seedTurns(30, time.Now())
-	assert.Equal(t, int64(31), s.turnNumberFor(active))
+	active := seedTurns(30, now)
+	assert.Equal(t, int64(31), s.turnNumberFor("active", active, now))
+}
+
+// The idle gap runs from the previous completion to the head's arrival, so a head
+// that has since waited past the threshold keeps its depth.
+func TestTurnPriority_QueueWaitDoesNotTriggerReset(t *testing.T) {
+	s := &turnPriorityStrategy{inactivitySeconds: 120}
+	now := time.Now()
+
+	m := seedTurns(40, now.Add(-130*time.Second))
+	headEnqueue := now.Add(-129 * time.Second)
+
+	assert.Equal(t, int64(41), s.turnNumberFor("sequential", m, headEnqueue))
+}
+
+// Unlabeled traffic aggregates unrelated clients under one ID, so its dispatched
+// count is not a session depth.
+func TestTurnPriority_DefaultFairnessIDScoresAsFirstTurn(t *testing.T) {
+	s := &turnPriorityStrategy{}
+	now := time.Now()
+
+	m := seedTurns(500, now)
+	assert.Equal(t, int64(1), s.turnNumberFor(metadata.DefaultFairnessID, m, now))
+	assert.Equal(t, int64(501), s.turnNumberFor("session-a", m, now))
+}
+
+func TestTurnPriority_DefaultFairnessIDLosesToSession(t *testing.T) {
+	s := &turnPriorityStrategy{timeWeight: 0}
+	now := time.Now()
+
+	idA, qA := turnInfo(metadata.DefaultFairnessID, seedTurns(500, now), now)
+	idB, qB := turnInfo("session", seedTurns(3, now), now)
+
+	got := s.Pick(0, map[string]QueueInfo{idA: qA, idB: qB})
+	require.NotNil(t, got)
+	assert.Equal(t, "session", got.FlowKey().ID)
 }
 
 // An in-flight request means the program is active regardless of how old its last
@@ -145,23 +198,27 @@ func TestTurnPriority_InFlightSuppressesReset(t *testing.T) {
 	m := seedTurns(5, time.Now().Add(-10*time.Minute))
 	m.RecordDispatched(time.Time{})
 
-	assert.Equal(t, int64(7), s.turnNumberFor(m))
+	assert.Equal(t, int64(7), s.turnNumberFor("fanout", m, time.Now()))
 }
 
 func TestTurnPriority_ZeroInactivityDisablesReset(t *testing.T) {
 	s := &turnPriorityStrategy{inactivitySeconds: 0}
 	m := seedTurns(9, time.Now().Add(-24*time.Hour))
-	assert.Equal(t, int64(10), s.turnNumberFor(m))
+	assert.Equal(t, int64(10), s.turnNumberFor("stale", m, time.Now()))
 }
 
-func TestTurnPriority_EqualCandidatesResolve(t *testing.T) {
-	s := &turnPriorityStrategy{timeWeight: 0.5}
+// With depth alone, equal-depth flows fall back to arrival order rather than map
+// iteration order.
+func TestTurnPriority_EqualDepthBreaksTieOnHeadWait(t *testing.T) {
+	s := &turnPriorityStrategy{timeWeight: 0}
 	now := time.Now()
 
-	idA, qA := turnInfo("alpha", seedTurns(3, now), now)
-	idB, qB := turnInfo("beta", seedTurns(3, now), now)
+	for range 20 {
+		idA, qA := turnInfo("earlier", seedTurns(3, now), now.Add(-10*time.Second))
+		idB, qB := turnInfo("later", seedTurns(3, now), now.Add(-2*time.Second))
 
-	got := s.Pick(0, map[string]QueueInfo{idA: qA, idB: qB})
-	require.NotNil(t, got)
-	assert.Contains(t, []string{"alpha", "beta"}, got.FlowKey().ID)
+		got := s.Pick(0, map[string]QueueInfo{idA: qA, idB: qB})
+		require.NotNil(t, got)
+		assert.Equal(t, "earlier", got.FlowKey().ID)
+	}
 }

@@ -9,9 +9,17 @@ The program-aware fairness policy schedules per-program queues using aggregated 
 
 Choose this policy when:
 
-* **Workflow-level fairness matters**: Distinct agentic workflows or tenants share the same pool, and you want fair allocation between them rather than between individual requests.
+* **Workflow-level fairness matters**: Distinct agentic workflows or tenants share the same pool, and you want allocation decided between them rather than between individual requests.
+
+Under `las`:
+
 * **Token cost varies widely between flows**: A program issuing a few large requests should not dominate a program issuing many small ones, or vice versa.
 * **Programs may go idle and return**: Idle programs should not retain accumulated service indefinitely; on return they should compete on near-equal footing with persistently active ones.
+
+Under `turn-priority`:
+
+* **Sessions are long and prefix reuse dominates cost**: Multi-turn sessions share a growing prefix, and dispatching the deepest ones keeps that prefix resident instead of re-prefilling it.
+* **Fairness IDs identify sessions**: Traffic carries a session header, so one fairness ID is one session. This strategy is not the right choice for a pool whose requests share a single ID.
 
 ## What it does
 
@@ -37,23 +45,38 @@ Depth alone would starve shallow sessions, so head wait is scored alongside it u
 score = turnNumber + turnPriorityTimeWeight * headWaitSeconds
 ```
 
-Head wait is unbounded, so a shallow program overtakes any deeper rival once it has waited long enough. The two terms are a raw count and raw seconds, so `turnPriorityTimeWeight` converts one second of waiting into a number of turns. A value tuned for one traffic profile does not carry over to a workload with a different depth or wait distribution.
+The two terms are a raw count and raw seconds, so `turnPriorityTimeWeight` converts one second of waiting into a number of turns. A value tuned for one traffic profile does not carry over to a workload with a different depth or wait distribution.
 
-A program that has been idle beyond `turnPriorityInactivitySeconds` counts as turn one and re-earns depth, on the grounds that a session dormant that long has stopped competing for its own prefix. That threshold is separate from `evictionTtlSeconds`, which governs only when per-program bookkeeping is reclaimed.
+Head wait is bounded by the flow controller's request TTL, which defaults to 60s and is measured from the same enqueue time this score reads. A waiting request therefore accrues at most
 
-The default of `120` leaves a margin over the longest activity observed within a session, so a program still taking turns keeps its depth. On an agentic trace replay averaging 48 turns per session, mean think time between turns was about 2.5s and the slowest turn-to-turn cycle reached 96s under the heaviest load tested. A cycle includes service and queueing, so the post-completion gap this threshold measures is smaller. Workloads whose sessions pause for longer need a higher value.
+```
+turnPriorityTimeWeight * requestTTL
+```
+
+turn-equivalents before it is shed, and that product is the maximum depth a newcomer can overcome. The default weight of `0.5` against a 60s TTL gives 30, so a turn-one request reaches a score of 31 and overtakes sessions up to about 30 turns deep, which covers the 48-turn sessions of the traces this was tuned against.
+
+The weight has to be chosen against that bound rather than in isolation. Lowering it to increase the depth bias shrinks the bound in proportion: at `0.05` a newcomer tops out at 4 turn-equivalents, and under sustained contention every request of a new session expires undispatched behind sessions deeper than that. Raising it past the depth of the workload converts the policy back towards arrival order. A deployment that changes `requestTTL` has to revisit the weight, since only the product matters.
+
+A program that has been idle beyond `turnPriorityInactivitySeconds` has its next request scored as turn one, on the grounds that a session dormant that long has stopped competing for its own prefix. Once that request is dispatched it re-prefills the whole conversation, and the program competes at its full depth again. The idle gap is measured from the program's last completion to the head request's arrival, so a request that has since been queuing does not itself age the program into a reset.
+
+The default of `120` leaves a margin over the longest gap observed within an active session, so a program still taking turns keeps its depth. On an agentic trace replay averaging 48 turns per session, mean think time between turns was about 2.5s and the slowest turn-to-turn cycle reached 96s under the heaviest load tested. That cycle figure includes service and queueing, while the gap this threshold measures spans only last completion to next arrival, so the effective margin is wider than the 24s difference suggests. Workloads whose sessions pause for longer between turns need a higher value.
 
 Under contention a prefix is evicted by capacity pressure while its program is still active, and ordering by turn depth is what keeps those prefixes resident. A low prefix-cache hit rate is therefore weak evidence for lowering this value.
 
+The strategy reads a program's dispatched count as its session depth, which holds only where one fairness ID is one session. Requests carrying neither the fairness ID header nor a session header share `default-flow`, whose count aggregates unrelated clients; that ID is scored at turn one so the shared count cannot buy it depth. Traffic that is not session-labeled is better served by a priority band on a different fairness policy.
+
 ## Unit of Fairness
 
-**Attained service**, measured as a weighted sum of input and output tokens consumed by the program. Output tokens are weighted twice as much as input tokens to reflect their relative compute cost.
+Under `turn-priority`, **session depth**: the count of requests already dispatched for the program, plus the waiting request.
+
+Under `las`, **attained service**, measured as a weighted sum of input and output tokens consumed by the program. Output tokens are weighted twice as much as input tokens to reflect their relative compute cost.
 
 ## Inputs consumed
 
 * **Program identity**: From the request's `FairnessID` field, which the framework populates from the fairness ID header.
 * **Queue state**: Reads queue length and the head item's enqueue time from the `FlowQueueAccessor`.
-* **Token usage**: From the `Response.Usage` field on stream completion.
+* **Token usage** (`las`): From the `Response.Usage` field on stream completion.
+* **Dispatched count, in-flight count, last completion time** (`turn-priority`): From the per-program metrics maintained across the request lifecycle.
 
 ## Configuration
 
@@ -79,8 +102,8 @@ flowControl:
 | `lasWeightService` | `0.8` | Weight on the inverted attained-service signal. Higher values prioritize underserved programs more aggressively. |
 | `lasWeightHeadWait` | `0.2` | Weight on the head-of-queue age. Acts as a tiebreaker on cold start when programs have equal attained service. |
 | `lasHalfLifeSeconds` | `60` | Wall-clock half-life of attained service. `0` disables decay, making attained service cumulative for the program's lifetime. |
-| `turnPriorityTimeWeight` | `0.05` | (`turn-priority`) Score contribution per second of head wait, against one point per turn of depth. `0` orders on depth alone. |
-| `turnPriorityInactivitySeconds` | `120` | (`turn-priority`) A program idle for longer than this counts as turn one. `0` disables the reset. |
+| `turnPriorityTimeWeight` | `0.5` | (`turn-priority`) Score contribution per second of head wait, against one point per turn of depth. `turnPriorityTimeWeight * requestTTL` bounds the depth a waiting request can overcome, which at the default is 30 turns. `0` orders on depth alone, with longer head wait breaking ties. |
+| `turnPriorityInactivitySeconds` | `120` | (`turn-priority`) A program idle for longer than this has its next request scored as turn one. `0` disables the inactivity reset. Depth is still lost when the program is evicted after `evictionTtlSeconds`. |
 | `evictionTtlSeconds` | `3600` | A program with no completion in this window is evicted from the metrics map. |
 | `evictionSweepSeconds` | `300` | How often the eviction sweep runs. Must be `> 0`. |
 
@@ -88,7 +111,7 @@ A complete sample is shipped at [`deploy/config/sim-program-aware-config.yaml`](
 
 ## Observability
 
-The plugin exports two shared collectors and one strategy-owned collector under the `llm_d_epp` Prometheus subsystem:
+The plugin exports two shared collectors under the `llm_d_epp` Prometheus subsystem, plus one owned by the `las` strategy. Under `turn-priority` the strategy registers no collectors, so `program_aware_attained_service_tokens` is absent:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
@@ -106,6 +129,8 @@ mean the scheduler is scoring the program on stale service.
 * **Abandoned requests block eviction**: Requests abandoned after dispatch leave `inFlight` non-zero, and the eviction sweep skips any program with non-zero `inFlight`, so its `ProgramMetrics` entry and Prometheus series persist indefinitely.
 * **Memory and label-series growth**: A new program ID adds a `ProgramMetrics` entry plus per-program Prometheus label series. The eviction sweep bounds growth, but a workload with rapidly churning program IDs (e.g. a fresh ID per request) will see TTL-bounded accumulation. Choose a TTL that matches your churn rate.
 * **Turn-priority weighting is scale-dependent**: the score sums a turn count and a wait in seconds, so `turnPriorityTimeWeight` converts between the two rather than balancing them proportionally. A value tuned for one traffic profile does not carry over to another with a different depth or wait distribution.
+* **Turn-priority anti-starvation is capped by the request TTL**: a waiting request accrues at most `turnPriorityTimeWeight * requestTTL` turn-equivalents before the flow controller sheds it, 30 at the defaults, so sessions deeper than that are never overtaken by a newcomer. The weight and the TTL have to be chosen together.
+* **Turn depth is read one dispatch behind**: the dispatched count is incremented after the pick, off the dispatch path, so consecutive picks for one program can score against a count that has not yet caught up.
 * **Decay accrues during generation**: Decay is continuous wall-clock time, including while a program's requests are in flight; the service consumed by an in-flight request is added back, post-decay, when it completes. With half-lives well above typical generation times this effect is negligible.
 
 ## Related Documentation

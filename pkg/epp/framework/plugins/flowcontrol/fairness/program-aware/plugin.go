@@ -45,7 +45,7 @@ func DefaultConfig() Config {
 		LASWeightHeadWait:    0.2,
 		LASHalfLifeSeconds:   60,
 
-		TurnPriorityTimeWeight:        0.05,
+		TurnPriorityTimeWeight:        0.5,
 		TurnPriorityInactivitySeconds: 120,
 	}
 }
